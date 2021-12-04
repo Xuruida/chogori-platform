@@ -165,6 +165,15 @@ Status K23SIPartitionModule::_validateWriteRequest(const dto::K23SIWriteRequest&
         return dto::K23SIStatus::OperationNotAllowed("schema version does not exist");
     }
 
+    if (auto* twim = _twimMgr.getTxnWIMeta(request.mtr.timestamp); twim != nullptr) {
+        if (twim->isAborted()) {
+            return dto::K23SIStatus::AbortConflict("The transaction has been aborted");
+        }
+        else if (twim->isCommitted()) {
+            return dto::K23SIStatus::BadParameter("The transaction has been committed");
+        }
+    }
+
     return _validateStaleWrite(request, versions);
 }
 // ********************** Validators
@@ -182,23 +191,57 @@ seastar::future<> K23SIPartitionModule::_registerVerbs() {
 
     RPC().registerRPCObserver<dto::K23SIReadRequest, dto::K23SIReadResponse>
     (dto::Verbs::K23SI_READ, [this](dto::K23SIReadRequest&& request) {
-        return handleRead(std::move(request), FastDeadline(_config.readTimeout()));
+        auto start = k2::Clock::now();
+        return handleRead(std::move(request), FastDeadline(_config.readTimeout()))
+               .then([this, start](auto&& response){
+                    _readOps++;
+                    auto end = k2::Clock::now();
+                    auto dur = end - start;
+                    _readLatency.add(dur);
+                    return std::move(response);
+               });
     });
 
     RPC().registerRPCObserver<dto::K23SIQueryRequest, dto::K23SIQueryResponse>
     (dto::Verbs::K23SI_QUERY, [this](dto::K23SIQueryRequest&& request) {
-        return handleQuery(std::move(request), dto::K23SIQueryResponse{}, FastDeadline(_config.readTimeout()));
+        auto start = k2::Clock::now();
+        return handleQuery(std::move(request), dto::K23SIQueryResponse{}, FastDeadline(_config.readTimeout()))
+                .then([this, start] (auto&& response) {
+                    _queryOps++;
+                    auto end = k2::Clock::now();
+                    auto dur = end - start;
+                    _queryLatency.add(dur);
+                    return std::move(response);
+               });
     });
 
     RPC().registerRPCObserver<dto::K23SIWriteRequest, dto::K23SIWriteResponse>
     (dto::Verbs::K23SI_WRITE, [this](dto::K23SIWriteRequest&& request) {
+        auto start = k2::Clock::now();
         return handleWrite(std::move(request), FastDeadline(_config.writeTimeout()))
-            .then([this] (auto&& resp) { return _respondAfterFlush(std::move(resp));});
+            .then([this, start] (auto&& resp) {
+                return _respondAfterFlush(std::move(resp))
+                        .then([this, start] (auto&& response) {
+                            _writeOps++;
+                            auto end = k2::Clock::now();
+                            auto dur = end - start;
+                            _writeLatency.add(dur);
+                            return std::move(response);
+                        });
+            });
     });
 
     RPC().registerRPCObserver<dto::K23SITxnPushRequest, dto::K23SITxnPushResponse>
     (dto::Verbs::K23SI_TXN_PUSH, [this](dto::K23SITxnPushRequest&& request) {
-        return handleTxnPush(std::move(request));
+        auto start = k2::Clock::now();
+        return handleTxnPush(std::move(request))
+                .then([this, start] (auto&& response) {
+                    _pushes++;
+                    auto end = k2::Clock::now();
+                    auto dur = end - start;
+                    _pushLatency.add(dur);
+                    return std::move(response);
+               });
     });
 
     RPC().registerRPCObserver<dto::K23SITxnEndRequest, dto::K23SITxnEndResponse>
@@ -214,8 +257,18 @@ seastar::future<> K23SIPartitionModule::_registerVerbs() {
 
     RPC().registerRPCObserver<dto::K23SITxnFinalizeRequest, dto::K23SITxnFinalizeResponse>
     (dto::Verbs::K23SI_TXN_FINALIZE, [this](dto::K23SITxnFinalizeRequest&& request) {
+        auto start = k2::Clock::now();
         return handleTxnFinalize(std::move(request))
-            .then([this] (auto&& resp) { return _respondAfterFlush(std::move(resp));});
+                .then([this, start] (auto&& resp) {
+                    return _respondAfterFlush(std::move(resp))
+                    .then([this, start] (auto&& response) {
+                                _finalizations++;
+                                auto end = k2::Clock::now();
+                                auto dur = end - start;
+                                _finalizationLatency.add(dur);
+                                return std::move(response);
+                            });
+                });
     });
 
     RPC().registerRPCObserver<dto::K23SIPushSchemaRequest, dto::K23SIPushSchemaResponse>
@@ -275,7 +328,42 @@ void K23SIPartitionModule::_unregisterVerbs() {
     api_server.deregisterAPIObserver("InspectAllKeys");
 }
 
+void K23SIPartitionModule::_registerMetrics() {
+    _metric_groups.clear();
+    std::vector<sm::label_instance> labels;
+    labels.push_back(sm::label_instance("total_cores", seastar::smp::count));
+
+    _metric_groups.add_group("Nodepool", {
+        sm::make_gauge("indexer_keys",[this]{ return _indexer.size();},
+                        sm::description("Number of keys in indexer"), labels),
+        sm::make_counter("read_operations", _readOps, sm::description("Number of read operations"), labels),
+        sm::make_counter("write_operations", _writeOps, sm::description("Number of write operations"), labels),
+        sm::make_counter("query_operations", _queryOps, sm::description("Number of query operations"), labels),
+        sm::make_counter("finalization_operations", _finalizations, sm::description("Number of finalizations requests"), labels),
+        sm::make_counter("push_operations", _pushes, sm::description("Number of pushses"), labels),
+        sm::make_gauge("active_WI", _activeWI, sm::description("Number of active WIs"), labels),
+        sm::make_counter("record_versions", _recordVersions, sm::description("Number of record versions over all records"), labels),
+        sm::make_histogram("read_pmem_engine_lantecy", [this]{ return _readPmemEngineLatency.getHistogram();},
+                sm::description("Latency of Read Pmem Engine Operations"), labels),
+        sm::make_histogram("write_pmem_engine_lantecy", [this]{ return _writePmemEngineLatency.getHistogram();},
+                sm::description("Latency of Write Pmem Engine Operations"), labels),
+        sm::make_histogram("read_latency", [this]{ return _readLatency.getHistogram();},
+                sm::description("Latency of Read Operations"), labels),
+        sm::make_histogram("write_latency", [this]{ return _writeLatency.getHistogram();},
+                sm::description("Latency of Write Operations"), labels),
+        sm::make_histogram("query_latency", [this]{ return _queryLatency.getHistogram();},
+                sm::description("Latency of Query Operations"), labels),
+        sm::make_histogram("finalization_latency", [this]{ return _finalizationLatency.getHistogram();},
+                sm::description("Latency of Finalizations"), labels),
+        sm::make_histogram("push_latency", [this]{ return _pushLatency.getHistogram();},
+                sm::description("Latency of Pushes"), labels)
+    });
+}
+
 seastar::future<> K23SIPartitionModule::start() {
+
+    _registerMetrics();
+
     _cpo.init(_config.cpoEndpoint());
     if (_cmeta.retentionPeriod < _config.minimumRetentionPeriod()) {
         K2LOG_W(log::skvsvr,
@@ -305,6 +393,14 @@ seastar::future<> K23SIPartitionModule::start() {
             });
             _retentionUpdateTimer.armPeriodic(_config.retentionTimestampUpdateInterval());
             _persistence = std::make_shared<Persistence>();
+            
+            PmemEngineConfig plogConfig;
+            std::string pmemPath = fmt::format("{}/shard{}",_config.PmemEnginePath(),seastar::this_shard_id());
+            strcpy(plogConfig.engine_path,pmemPath.c_str());
+            PmemEngine * enginePtr = nullptr;
+            auto status = PmemEngine::open(plogConfig, &enginePtr);
+            _pmemEngine.reset(enginePtr);
+
             return _persistence->start()
                 .then([this] {
                     return _twimMgr.start(_retentionTimestamp, _persistence);
@@ -343,14 +439,29 @@ seastar::future<> K23SIPartitionModule::gracefulStop() {
         });
 }
 
-seastar::future<std::tuple<Status, dto::K23SIReadResponse>>
-_makeReadOK(dto::DataRecord* rec) {
+seastar::future<std::tuple<Status, dto::K23SIReadResponse>> 
+K23SIPartitionModule::_makeReadOK(dto::DataRecord* rec) {
     if (rec == nullptr || rec->isTombstone) {
         return RPCResponse(dto::K23SIStatus::KeyNotFound("read did not find key"), dto::K23SIReadResponse{});
     }
 
     auto response = dto::K23SIReadResponse();
-    response.value = rec->value.share();
+    auto start = k2::Clock::now();
+    auto payload_status = _pmemEngine->read(rec->value_pointer);
+    auto end = k2::Clock::now();
+    auto dur = end - start;
+    _readPmemEngineLatency.add(dur);
+    
+    if( std::get<0>(payload_status).is2xxOK()){
+        k2::dto::SKVRecord::Storage read_storage{};
+        std::get<1>(payload_status).read(read_storage);
+        response.value = read_storage.share();
+        K2LOG_D(log::skvsvr, "Read data from pmem log: {}", read_storage);
+        K2LOG_D(log::skvsvr, "Expect data from dram: {}", rec->value);
+    }
+    else{
+        response.value = rec->value.share();
+    }
     return RPCResponse(dto::K23SIStatus::OK("read succeeded"), std::move(response));
 }
 
@@ -390,7 +501,12 @@ IndexerIterator K23SIPartitionModule::_initializeScan(const dto::Key& start, boo
     // ELSE IF lower_bound returns a key bigger than start, find the first key not bigger than start;
     if (reverse) {
         if (start.partitionKey == "" || key_it == _indexer.end()) {
-            key_it = (++_indexer.rbegin()).base();
+            if(!_indexer.empty()){ // handle empty records
+                key_it = (++_indexer.rbegin()).base();
+            }
+            else{
+                key_it = _indexer.end();
+            }
         } else if (key_it->first == start && exclusiveKey) {
             _scanAdvance(key_it, reverse, start.schemaName);
         } else if (key_it->first > start) {
@@ -665,20 +781,14 @@ std::size_t K23SIPartitionModule::_findField(const dto::Schema schema, k2::Strin
 template <typename T>
 void _advancePayloadPosition(const dto::SchemaField& field, Payload& payload, bool& success) {
     (void) field;
-    T value{};
-    success = payload.read(value);
+    payload.skip<T>();
+    success = true;
 }
 
 template <typename T>
 void _copyPayloadBaseToUpdate(const dto::SchemaField& field, Payload& base, Payload& update, bool& success) {
     (void) field;
-    T value{};
-    success = base.read(value);
-    if (!success) {
-        return;
-    }
-
-    update.write(value);
+    success = base.copyToPayload<T>(update);
 }
 
 template <typename T>
@@ -998,6 +1108,7 @@ K23SIPartitionModule::handleWrite(dto::K23SIWriteRequest&& request, FastDeadline
     // NB: failures in processing a write do not require that we set the TR state to aborted at the TRH. We rely on
     //     the client to do the correct thing and issue an abort on a failure.
     K2LOG_D(log::skvsvr, "Partition: {}, handle write: {}", _partition, request);
+
     if (request.designateTRH) {
         if (!_validateRequestPartition(request)) {
             // tell client their collection partition is gone
@@ -1069,7 +1180,15 @@ K23SIPartitionModule::_processWrite(dto::K23SIWriteRequest&& request, FastDeadli
         head = &(vset.committed[0]);
     }
 
-    if (request.rejectIfExists && head && !head->isTombstone) {
+    // Exists precondition can be set by the user (e.g. with a delete to know if a record was actually
+    // delete) and it is set for partial updates
+    if (request.precondition == ExistencePrecondition::Exists && (!head || head->isTombstone)) {
+        K2LOG_D(log::skvsvr, "Request {} not accepted since Exists precondition failed", request);
+        _readCache->insertInterval(request.key, request.key, request.mtr.timestamp);
+        return RPCResponse(dto::K23SIStatus::ConditionFailed("Exists precondition failed"), dto::K23SIWriteResponse{});
+    }
+
+    if (request.precondition == ExistencePrecondition::NotExists && head && !head->isTombstone) {
         // Need to add to read cache to prevent an erase coming in before this requests timestamp
         // If the condition passes (ie, there was no previous version and the insert succeeds) then
         // we do not need to insert into the read cache because the write intent will handle conflicts
@@ -1084,15 +1203,11 @@ K23SIPartitionModule::_processWrite(dto::K23SIWriteRequest&& request, FastDeadli
 
     if (request.fieldsForPartialUpdate.size() > 0) {
         // parse the partial record to full record
-        if (!head || head->isTombstone) {
-            K2LOG_D(log::skvsvr, "partial update request {} not accepted since there is no previous version to update", request);
-            // cannot parse partial record without a version
-            return RPCResponse(dto::K23SIStatus::KeyNotFound("can not partial update with no/deleted version"), dto::K23SIWriteResponse{});
-        }
         if (!_parsePartialRecord(request, *head)) {
             K2LOG_D(log::skvsvr, "can not parse partial record for key {}", request.key);
             head->value.fieldData.seek(0);
-            return RPCResponse(dto::K23SIStatus::BadParameter("missing fields or can not interpret partialUpdate"), dto::K23SIWriteResponse{});
+            _readCache->insertInterval(request.key, request.key, request.mtr.timestamp);
+            return RPCResponse(dto::K23SIStatus::ConditionFailed("missing fields or can not interpret partialUpdate"), dto::K23SIWriteResponse{});
         }
     }
 
@@ -1107,15 +1222,28 @@ Status
 K23SIPartitionModule::_createWI(dto::K23SIWriteRequest&& request, VersionSet& versions) {
     K2LOG_D(log::skvsvr, "Write Request creating WI: {}", request);
     // we need to copy this data into a new memory block so that we don't hold onto and fragment the transport memory
-    dto::DataRecord rec{.value=request.value.copy(), .timestamp=request.mtr.timestamp, .isTombstone=request.isDelete};
-
-    versions.WI.emplace(std::move(rec), request.request_id);
+    dto::DataRecord rec{.value=request.value.copy(),.value_pointer ={0,0}, .timestamp=request.mtr.timestamp, .isTombstone=request.isDelete};
 
     auto status = _twimMgr.addWrite(std::move(request.mtr), std::move(request.key), std::move(request.trh), std::move(request.trhCollection));
 
     if (!status.is2xxOK()) {
         return status;
     }
+    k2::Payload payload(k2::Payload::DefaultAllocator); 
+    payload.write(rec.value);
+    auto start = k2::Clock::now();
+    auto pmem_status = _pmemEngine->append(payload);
+    auto end = k2::Clock::now();
+    auto dur = end - start;
+    _writePmemEngineLatency.add(dur);
+    
+    if (std::get<0>(pmem_status).is2xxOK()){
+        rec.value_pointer = std::get<1>(pmem_status);
+    }
+    // the TWIM accepted the write. Add it as a WI now
+    versions.WI.emplace(std::move(rec), request.request_id);
+    _activeWI++;
+
     _persistence->append(versions.WI->data);
     return Statuses::S201_Created("WI created");
 }
@@ -1143,7 +1271,6 @@ K23SIPartitionModule::handleTxnEnd(dto::K23SITxnEndRequest&& request) {
         K2LOG_D(log::skvsvr, "transaction end too old for txn={}", request.mtr);
         return RPCResponse(dto::K23SIStatus::RefreshCollection("collection refresh needed in end"), dto::K23SITxnEndResponse{});
     }
-
     return _txnMgr.endTxn(std::move(request));
 }
 
@@ -1235,6 +1362,8 @@ K23SIPartitionModule::_doPush(dto::Key key, dto::Timestamp incumbentId, dto::K23
                             return seastar::make_ready_future<Status>(std::move(status));
                         }
                         versions.committed.push_front(std::move(versions.WI->data));
+                        _recordVersions++;
+                        _activeWI--;
                         versions.WI.reset();
                         break;
                     }
@@ -1310,7 +1439,9 @@ Status K23SIPartitionModule::_finalizeTxnWIs(dto::Timestamp txnts, dto::EndActio
             case dto::EndAction::Commit: {
                 K2LOG_D(log::skvsvr, "committing {}, in txn {}", key, *twim);
                 versions.committed.push_front(std::move(versions.WI->data));
+                _recordVersions++;
                 versions.WI.reset();
+                _activeWI--;
                 break;
             }
             default:
@@ -1354,6 +1485,7 @@ K23SIPartitionModule::handleInspectRecords(dto::K23SIInspectRecordsRequest&& req
     if (versions.WI.has_value()) {
         dto::DataRecord copy {
             .value=versions.WI->data.value.share(),
+            .value_pointer = versions.WI->data.value_pointer,
             .timestamp=versions.WI->data.timestamp,
             .isTombstone=versions.WI->data.isTombstone
         };
@@ -1364,6 +1496,7 @@ K23SIPartitionModule::handleInspectRecords(dto::K23SIInspectRecordsRequest&& req
     for (auto& rec : versions.committed) {
         dto::DataRecord copy{
             .value=rec.value.share(),
+            .value_pointer = rec.value_pointer,
             .timestamp=rec.timestamp,
             .isTombstone=rec.isTombstone
         };
@@ -1402,6 +1535,7 @@ K23SIPartitionModule::handleInspectWIs(dto::K23SIInspectWIsRequest&&) {
         dto::WriteIntent copy {
             .data = {
                 .value=rec.data.value.share(),
+                .value_pointer = rec.data.value_pointer,
                 .timestamp=rec.data.timestamp,
                 .isTombstone=rec.data.isTombstone
             },
@@ -1481,10 +1615,14 @@ K23SIPartitionModule::_getDataRecordForRead(VersionSet& versions, dto::Timestamp
 // Helper to remove a WI and delete the key from the indexer of there are no committed records
 void K23SIPartitionModule::_removeWI(IndexerIterator it) {
     if (it->second.committed.size() == 0) {
+        if(it->second.WI.has_value())
+            _activeWI--;
         _indexer.erase(it);
         return;
     }
 
+    if(it->second.WI.has_value())
+        _activeWI--;
     it->second.WI.reset();
 }
 
